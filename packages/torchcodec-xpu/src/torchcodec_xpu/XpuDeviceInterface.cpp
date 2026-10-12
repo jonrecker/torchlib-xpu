@@ -133,6 +133,48 @@ sycl::ext::oneapi::experimental::architecture getArchitecture(
       sycl::ext::oneapi::experimental::info::device::architecture>();
 }
 
+// Imports a dma-buf as device USM through Level Zero.
+//
+// The import is given a dup() of dmaBufFd, in order to avoid a
+// potential double-close situation in which both the calling
+// function (the plugin) and the compute-runtime driver
+// attempt to close the same fd. This has been observed to
+// cause errors during multi-threaded execution because the same fd
+// number may be reused by another thread after the first close()
+// but before the second close().
+//
+// With importDmaBufAsUsm() the caller keeps ownership of dmaBufFd
+// and must close() it exactly once. This is correct whether or
+// not compute-runtime closes the descriptor it is given: the
+// caller never closes a number the driver may already have released,
+// which another thread could since have been handed,
+// e.g. by vaExportSurfaceHandle().
+//
+// If the import fails, the duplicate is deliberately left open: ownership
+// after a failed import is not specified, so closing it could close
+// another thread's descriptor. A failed import therefore leaks at most
+// one fd, but only in the case of an error which is anyway reported
+// to the caller.
+ze_result_t importDmaBufAsUsm(
+    ze_context_handle_t zeCtx,
+    ze_device_handle_t zeDevice,
+    int dmaBufFd,
+    size_t size,
+    void** usmPtr) {
+  int importFd = dup(dmaBufFd);
+  if (importFd < 0) {
+    return ZE_RESULT_ERROR_UNKNOWN;
+  }
+  ze_external_memory_import_fd_t import_fd_desc{};
+  import_fd_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
+  import_fd_desc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+  import_fd_desc.fd = importFd;
+
+  ze_device_mem_alloc_desc_t alloc_desc{};
+  alloc_desc.pNext = &import_fd_desc;
+  return zeMemAllocDevice(zeCtx, &alloc_desc, size, 0, zeDevice, usmPtr);
+}
+
 // Resolves the VAAPI render-node path this XPU device should open.
 std::string resolveRenderD(const StableDevice& device) {
   const std::string defaultRenderD = "/dev/dri/renderD128";
@@ -392,17 +434,17 @@ torch::stable::Tensor AVFrameToTensor(
       })
       .wait();
 
-  ze_external_memory_import_fd_t import_fd_desc{};
-  import_fd_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
-  import_fd_desc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
-  import_fd_desc.fd = desc.objects[0].fd;
-
-  ze_device_mem_alloc_desc_t alloc_desc{};
-  alloc_desc.pNext = &import_fd_desc;
   void* usm_ptr = nullptr;
 
-  ze_result_t res = zeMemAllocDevice(
-      context->zeCtx, &alloc_desc, desc.objects[0].size, 0, ze_device, &usm_ptr);
+  ze_result_t res = xpu::importDmaBufAsUsm(
+      context->zeCtx,
+      ze_device,
+      desc.objects[0].fd,
+      desc.objects[0].size,
+      &usm_ptr);
+  if (res != ZE_RESULT_SUCCESS) {
+    close(desc.objects[0].fd);
+  }
   TORCH_CHECK(
       res == ZE_RESULT_SUCCESS, "Failed to import fd=", desc.objects[0].fd);
 
@@ -617,22 +659,17 @@ bool XpuDeviceInterface::convert_av_frame_to_frame_output_with_sycl(
       })
       .wait();
 
-  ze_external_memory_import_fd_t import_fd_desc{};
-  import_fd_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
-  import_fd_desc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
-  import_fd_desc.fd = desc.objects[0].fd;
-
-  ze_device_mem_alloc_desc_t alloc_desc{};
-  alloc_desc.pNext = &import_fd_desc;
   void* usm_ptr = nullptr;
 
-  ze_result_t res = zeMemAllocDevice(
+  ze_result_t res = xpu::importDmaBufAsUsm(
       context->zeCtx,
-      &alloc_desc,
-      desc.objects[0].size,
-      0,
       ze_device,
+      desc.objects[0].fd,
+      desc.objects[0].size,
       &usm_ptr);
+  if (res != ZE_RESULT_SUCCESS) {
+    close(desc.objects[0].fd);
+  }
   TORCH_CHECK(
       res == ZE_RESULT_SUCCESS, "Failed to import fd=", desc.objects[0].fd);
 
@@ -908,16 +945,9 @@ UniqueAVFrame XpuDeviceInterface::convert_tensor_to_av_frame_for_encoding_with_s
       })
       .wait();
 
-  ze_external_memory_import_fd_t import_fd_desc{};
-  import_fd_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
-  import_fd_desc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
-  import_fd_desc.fd    = desc.objects[0].fd;
-
-  ze_device_mem_alloc_desc_t alloc_desc{};
-  alloc_desc.pNext = &import_fd_desc;
   void* usm_ptr = nullptr;
-  ze_result_t res = zeMemAllocDevice(
-      zeCtx, &alloc_desc, desc.objects[0].size, 0, zeDevice, &usm_ptr);
+  ze_result_t res = xpu::importDmaBufAsUsm(
+      zeCtx, zeDevice, desc.objects[0].fd, desc.objects[0].size, &usm_ptr);
 
   if (res != ZE_RESULT_SUCCESS) {
     close(desc.objects[0].fd);
