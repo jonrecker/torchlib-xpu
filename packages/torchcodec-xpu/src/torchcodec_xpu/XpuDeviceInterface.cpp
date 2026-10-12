@@ -133,6 +133,25 @@ sycl::ext::oneapi::experimental::architecture getArchitecture(
       sycl::ext::oneapi::experimental::info::device::architecture>();
 }
 
+// Returns the Level Zero context and device handles behind PyTorch's
+// current XPU queue for the given device. They are read with
+// sycl::get_native() on the queue's context and device, which submits no
+// work to the queue and does not wait on it, so threads sharing the queue
+// do not interact through it.
+struct ZeHandles {
+  ze_context_handle_t context;
+  ze_device_handle_t device;
+};
+
+ZeHandles getZeHandles(const StableDevice& device) {
+  sycl::queue queue = c10::xpu::getCurrentXPUStream(device.index());
+  return {
+      sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+          queue.get_context()),
+      sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+          queue.get_device())};
+}
+
 // Resolves the VAAPI render-node path this XPU device should open.
 std::string resolveRenderD(const StableDevice& device) {
   const std::string defaultRenderD = "/dev/dri/renderD128";
@@ -378,19 +397,9 @@ torch::stable::Tensor AVFrameToTensor(
       desc.layers[0].num_planes);
 
   std::unique_ptr<xpuManagerCtx> context = std::make_unique<xpuManagerCtx>();
-  ze_device_handle_t ze_device{};
-  sycl::queue queue = c10::xpu::getCurrentXPUStream(device.index());
-
-  queue
-      .submit([&](sycl::handler& cgh) {
-        cgh.host_task([&](const sycl::interop_handle& ih) {
-          context->zeCtx =
-              ih.get_native_context<sycl::backend::ext_oneapi_level_zero>();
-          ze_device =
-              ih.get_native_device<sycl::backend::ext_oneapi_level_zero>();
-        });
-      })
-      .wait();
+  xpu::ZeHandles ze = xpu::getZeHandles(device);
+  context->zeCtx = ze.context;
+  ze_device_handle_t ze_device = ze.device;
 
   ze_external_memory_import_fd_t import_fd_desc{};
   import_fd_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
@@ -604,18 +613,10 @@ bool XpuDeviceInterface::convert_av_frame_to_frame_output_with_sycl(
 
   TORCH_CHECK(desc.num_objects == 1, "Expected 1 fd, got ", desc.num_objects);
   std::unique_ptr<xpuManagerCtx> context = std::make_unique<xpuManagerCtx>();
-  ze_device_handle_t ze_device{};
   sycl::queue queue = c10::xpu::getCurrentXPUStream(device_.index());
-  queue
-      .submit([&](sycl::handler& cgh) {
-        cgh.host_task([&](const sycl::interop_handle& ih) {
-          context->zeCtx =
-              ih.get_native_context<sycl::backend::ext_oneapi_level_zero>();
-          ze_device =
-              ih.get_native_device<sycl::backend::ext_oneapi_level_zero>();
-        });
-      })
-      .wait();
+  xpu::ZeHandles ze = xpu::getZeHandles(device_);
+  context->zeCtx = ze.context;
+  ze_device_handle_t ze_device = ze.device;
 
   ze_external_memory_import_fd_t import_fd_desc{};
   import_fd_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
@@ -895,18 +896,11 @@ UniqueAVFrame XpuDeviceInterface::convert_tensor_to_av_frame_for_encoding_with_s
       "Unsupported NV12 export layout: num_layers=", desc.num_layers,
       " layers[0].num_planes=", desc.layers[0].num_planes);
 
-  // Get Level Zero context and device handles via SYCL interop.
+  // Get the Level Zero context and device handles.
   sycl::queue queue = c10::xpu::getCurrentXPUStream(device_.index());
-  ze_context_handle_t zeCtx  = nullptr;
-  ze_device_handle_t  zeDevice = nullptr;
-  queue
-      .submit([&](sycl::handler& cgh) {
-        cgh.host_task([&](const sycl::interop_handle& ih) {
-          zeCtx    = ih.get_native_context<sycl::backend::ext_oneapi_level_zero>();
-          zeDevice = ih.get_native_device<sycl::backend::ext_oneapi_level_zero>();
-        });
-      })
-      .wait();
+  xpu::ZeHandles ze = xpu::getZeHandles(device_);
+  ze_context_handle_t zeCtx = ze.context;
+  ze_device_handle_t zeDevice = ze.device;
 
   ze_external_memory_import_fd_t import_fd_desc{};
   import_fd_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
