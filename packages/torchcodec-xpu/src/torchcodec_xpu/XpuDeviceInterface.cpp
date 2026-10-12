@@ -172,7 +172,25 @@ ze_result_t importDmaBufAsUsm(
 
   ze_device_mem_alloc_desc_t alloc_desc{};
   alloc_desc.pNext = &import_fd_desc;
-  return zeMemAllocDevice(zeCtx, &alloc_desc, size, 0, zeDevice, usmPtr);
+  ze_result_t res =
+      zeMemAllocDevice(zeCtx, &alloc_desc, size, 0, zeDevice, usmPtr);
+  if (res != ZE_RESULT_SUCCESS) {
+    return res;
+  }
+  // Make the allocation resident right after the import, which issues the
+  // DRM_XE_VM_BIND now rather than lazily at first submit. This works around
+  // a compute-runtime issue: with several threads importing and freeing
+  // concurrently, an import can succeed with no bind ever issued, and the
+  // first kernel using the pointer then page-faults (-ENOENT) and resets the
+  // queue (UR_RESULT_ERROR_DEVICE_LOST / OUT_OF_RESOURCES). No 
+  // zeContextEvictMemory() is needed: the Level Zero spec says memory is
+  // implicitly evicted when freed.
+  res = zeContextMakeMemoryResident(zeCtx, zeDevice, *usmPtr, size);
+  if (res != ZE_RESULT_SUCCESS) {
+    zeMemFree(zeCtx, *usmPtr);
+    *usmPtr = nullptr;
+  }
+  return res;
 }
 
 // Resolves the VAAPI render-node path this XPU device should open.
