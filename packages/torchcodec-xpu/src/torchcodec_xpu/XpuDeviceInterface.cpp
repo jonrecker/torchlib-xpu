@@ -7,6 +7,9 @@
 #include <string>
 #include <unordered_map>
 #include <filesystem>
+#include <deque>
+#include <mutex>
+#include <vector>
 
 #include <level_zero/ze_api.h>
 #include <va/va_drmcommon.h>
@@ -404,10 +407,126 @@ struct xpuManagerCtx {
   ze_context_handle_t zeCtx = nullptr;
 };
 
+// Imported dma-bufs are not freed when their tensor is destroyed. The GPU work
+// that reads the import (the copy_ in convert_av_frame_to_frame_output_with_vaapi)
+// is queued asynchronously, so freeing straight away unbinds the memory while
+// that work is still waiting in the queue, which makes the GPU fault and reset.
+// The same goes for the VAAPI surface the import aliases: the decoder must not
+// recycle it before the GPU is done reading.
+//
+// Instead the deleter records a barrier event on the current stream (the stream
+// the consumer was queued on, because the tensor is consumed and destroyed on
+// the same thread) and parks the import and the AVFrame in a pending list.
+// Entries are freed once their event has completed, polled without blocking at
+// each deleter and each new import.
+//
+// kMaxPendingFrees bounds the list. In practice 64 pending frees means 64 live
+// imports plus 64 held VAAPI surfaces: about 64 x 8 MiB = 512 MiB of GPU memory
+// at 1080p RGBA (about 2 GiB at 4K), summed over all threads. It is reached only
+// when the GPU is more than 64 frames behind the CPU threads; the thread that
+// hits it then blocks until the oldest entry has completed. Below that, the
+// deleter never blocks.
+constexpr size_t kMaxPendingFrees = 64;
+
+struct PendingFree {
+  sycl::event event;
+  ze_context_handle_t zeCtx = nullptr;
+  void* ptr = nullptr;
+  UniqueAVFrame avFrame;
+};
+
+// Intentionally leaked. Tensors can outlive the decoder and the device context,
+// and entries still pending at process exit are left for the driver to release,
+// rather than being freed during static destruction.
+std::mutex& pendingFreesMutex() {
+  static std::mutex* m = new std::mutex();
+  return *m;
+}
+
+std::deque<PendingFree>& pendingFrees() {
+  static std::deque<PendingFree>* q = new std::deque<PendingFree>();
+  return *q;
+}
+
+bool isComplete(sycl::event& event) {
+  try {
+    return event.get_info<sycl::info::event::command_execution_status>() ==
+        sycl::info::event_command_status::complete;
+  } catch (...) {
+    try {
+      event.wait();
+    } catch (...) {
+    }
+    return true;
+  }
+}
+
+void freePending(PendingFree& pending) {
+  zeMemFree(pending.zeCtx, pending.ptr);
+  pending.avFrame.reset();
+}
+
+// Frees the entries whose GPU work has completed. Never blocks on the GPU.
+void reapCompletedFrees() {
+  std::vector<PendingFree> done;
+  {
+    std::lock_guard<std::mutex> lock(pendingFreesMutex());
+    auto& pending = pendingFrees();
+    for (auto it = pending.begin(); it != pending.end();) {
+      if (isComplete(it->event)) {
+        done.push_back(std::move(*it));
+        it = pending.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto& entry : done) {
+    freePending(entry);
+  }
+}
+
 void deleter(DLManagedTensor* self) {
   std::unique_ptr<DLManagedTensor> tensor(self);
   std::unique_ptr<xpuManagerCtx> context((xpuManagerCtx*)self->manager_ctx);
-  zeMemFree(context->zeCtx, self->dl_tensor.data);
+
+  PendingFree entry;
+  entry.zeCtx = context->zeCtx;
+  entry.ptr = self->dl_tensor.data;
+  entry.avFrame = std::move(context->avFrame);
+  try {
+    sycl::queue queue =
+        c10::xpu::getCurrentXPUStream(self->dl_tensor.device.device_id);
+    entry.event = queue.ext_oneapi_submit_barrier();
+  } catch (...) {
+    // Cannot order the free after the queued work: wait for everything.
+    c10::xpu::syncStreamsOnDevice(self->dl_tensor.device.device_id);
+    freePending(entry);
+    free(self->dl_tensor.shape);
+    free(self->dl_tensor.strides);
+    return;
+  }
+
+  bool overflow = false;
+  PendingFree oldest;
+  {
+    std::lock_guard<std::mutex> lock(pendingFreesMutex());
+    auto& pending = pendingFrees();
+    pending.push_back(std::move(entry));
+    if (pending.size() > kMaxPendingFrees) {
+      oldest = std::move(pending.front());
+      pending.pop_front();
+      overflow = true;
+    }
+  }
+  if (overflow) {
+    if (!isComplete(oldest.event)) {
+      oldest.event.wait();
+    }
+    freePending(oldest);
+  }
+  reapCompletedFrees();
+
   free(self->dl_tensor.shape);
   free(self->dl_tensor.strides);
 }
@@ -416,6 +535,8 @@ torch::stable::Tensor AVFrameToTensor(
     const StableDevice& device,
     const UniqueAVFrame& frame) {
   TORCH_CHECK_EQ(frame->format, AV_PIX_FMT_VAAPI);
+
+  reapCompletedFrees();
 
   VADRMPRIMESurfaceDescriptor desc{};
 
