@@ -30,6 +30,7 @@ NUM_FRAMES = 10
 RESIZE = 256
 TIMEOUT_SECONDS = 240
 REPETITIONS_RESIDENCY = 5
+REPETITIONS_DEFERRED_FREE = 2
 
 WORKLOAD = """
 import sys
@@ -54,10 +55,15 @@ def decode_and_resize():
 
 
 for _ in range(repetitions):
-    with ThreadPoolExecutor(num_threads) as pool:
+    pool = ThreadPoolExecutor(num_threads)
+    try:
         futures = [pool.submit(decode_and_resize) for _ in range(batch_size)]
         for future in futures:
             assert len(future.result()) > 0
+    finally:
+        # On the first failure drop the queued tasks instead of running them
+        # all, so a failing run ends within seconds.
+        pool.shutdown(wait=True, cancel_futures=True)
 torch.xpu.synchronize()
 """
 
@@ -108,3 +114,23 @@ def test_dataloader_workload_without_resident_import(xpu_clip_1080p: str) -> Non
     fraction of runs, so the workload is repeated.
     """
     _run_workload(xpu_clip_1080p, repetitions=REPETITIONS_RESIDENCY, use_sycl_kernels="1")
+
+
+def test_dataloader_workload_without_deferred_import_free(xpu_clip_1080p: str) -> None:
+    """Detects freeing the VAAPI dma-buf import before the GPU is done with it.
+
+    With USE_SYCL_KERNELS=0 the imported surface is wrapped in a tensor that is
+    consumed by an asynchronous copy_ and destroyed right after. If its deleter
+    calls zeMemFree at once, the memory is unbound while the copy is still
+    queued behind other threads' work: the GPU takes read page faults (-EINVAL)
+    in the freed import, the queue is reset, and the workload fails with
+    UR_RESULT_ERROR_OUT_OF_RESOURCES. The fix defers the free until a barrier
+    event on the stream has completed. The failure is timing dependent, so the
+    workload is repeated. USE_SYCL_KERNELS=1 waits on the queue before its own
+    free and is not affected.
+    """
+    _run_workload(
+        xpu_clip_1080p,
+        repetitions=REPETITIONS_DEFERRED_FREE,
+        use_sycl_kernels="0",
+    )
