@@ -440,8 +440,11 @@ torch::stable::Tensor XpuDeviceInterface::AVFrameToTensor(
 
   ze_result_t res = zeMemAllocDevice(
       context->zeCtx, &alloc_desc, desc.objects[0].size, 0, ze_device_, &usm_ptr);
-  TORCH_CHECK(
-      res == ZE_RESULT_SUCCESS, "Failed to import fd=", desc.objects[0].fd);
+  if (res != ZE_RESULT_SUCCESS) {
+    // The driver takes the fd only on a successful import.
+    close(desc.objects[0].fd);
+    TORCH_CHECK(false, "Failed to import fd=", desc.objects[0].fd);
+  }
 
   if (!l0_owns_fd_) {
     close(desc.objects[0].fd);
@@ -674,8 +677,11 @@ bool XpuDeviceInterface::convert_av_frame_to_frame_output_with_sycl(
       0,
       ze_device_,
       &usm_ptr);
-  TORCH_CHECK(
-      res == ZE_RESULT_SUCCESS, "Failed to import fd=", desc.objects[0].fd);
+  if (res != ZE_RESULT_SUCCESS) {
+    // The driver takes the fd only on a successful import.
+    close(desc.objects[0].fd);
+    TORCH_CHECK(false, "Failed to import fd=", desc.objects[0].fd);
+  }
 
   if (!l0_owns_fd_) {
     close(desc.objects[0].fd);
