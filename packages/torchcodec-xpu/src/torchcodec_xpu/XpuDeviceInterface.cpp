@@ -137,6 +137,26 @@ bool l0DriverOwnsImportedFd(const sycl::device& dev) {
   return apiVersion >= ZE_MAKE_VERSION(1, 15);
 }
 
+// Works around a compute-runtime race: an import takes its allocation id
+// before the driver publishes the allocation, so a kernel submit on another
+// thread in between can skip it in the indirect-access residency scan. The
+// import is then never bound, and the first kernel using it page-faults
+// (UR_RESULT_ERROR_DEVICE_LOST / OUT_OF_RESOURCES). Making the allocation
+// resident right after the import binds it by pointer, independent of the
+// scan. No zeContextEvictMemory() is needed: the Level Zero spec says memory
+// is implicitly evicted when freed. On failure the allocation is freed.
+ze_result_t makeImportedMemoryResident(
+    ze_context_handle_t zeCtx,
+    ze_device_handle_t zeDevice,
+    void* usmPtr,
+    size_t size) {
+  ze_result_t res = zeContextMakeMemoryResident(zeCtx, zeDevice, usmPtr, size);
+  if (res != ZE_RESULT_SUCCESS) {
+    zeMemFree(zeCtx, usmPtr);
+  }
+  return res;
+}
+
 sycl::ext::oneapi::experimental::architecture getArchitecture(
     const sycl::device& device) {
   return device.get_info<
@@ -427,6 +447,13 @@ torch::stable::Tensor XpuDeviceInterface::AVFrameToTensor(
     close(desc.objects[0].fd);
   }
 
+  res = xpu::makeImportedMemoryResident(
+      context->zeCtx, ze_device_, usm_ptr, desc.objects[0].size);
+  TORCH_CHECK(
+      res == ZE_RESULT_SUCCESS,
+      "Failed to make imported memory resident, fd=",
+      desc.objects[0].fd);
+
   std::unique_ptr<DLManagedTensor> dl_dst = std::make_unique<DLManagedTensor>();
   int64_t* shape = (int64_t*)malloc(3*sizeof(int64_t));
 
@@ -653,6 +680,13 @@ bool XpuDeviceInterface::convert_av_frame_to_frame_output_with_sycl(
   if (!l0_owns_fd_) {
     close(desc.objects[0].fd);
   }
+
+  res = xpu::makeImportedMemoryResident(
+      ze_context_, ze_device_, usm_ptr, desc.objects[0].size);
+  TORCH_CHECK(
+      res == ZE_RESULT_SUCCESS,
+      "Failed to make imported memory resident, fd=",
+      desc.objects[0].fd);
 
   convertNV12ToRGB(
       c10::xpu::getCurrentXPUStream(device_.index()),
@@ -930,6 +964,20 @@ UniqueAVFrame XpuDeviceInterface::convert_tensor_to_av_frame_for_encoding_with_s
         "zeMemAllocDevice failed importing encode surface fd=",
         desc.objects[0].fd);
    }
+
+  res = xpu::makeImportedMemoryResident(
+      ze_context_, ze_device_, usm_ptr, desc.objects[0].size);
+  if (res != ZE_RESULT_SUCCESS) {
+    // The allocation was freed; the fd is still ours unless the driver
+    // took ownership on import.
+    if (!l0_owns_fd_) {
+      close(desc.objects[0].fd);
+    }
+    TORCH_CHECK(
+        false,
+        "Failed to make imported encode surface resident, fd=",
+        desc.objects[0].fd);
+  }
 
   // Extract Y and UV plane pointers and pitches for both layouts
   uint8_t* y_ptr;
